@@ -1,0 +1,17 @@
+DESCRIPTION.txt
+LICENSE
+MANIFEST.in
+README.md
+setup.py
+selfcheckgpt/__init__.py
+selfcheckgpt/modeling_mqag.py
+selfcheckgpt/modeling_ngram.py
+selfcheckgpt/modeling_selfcheck.py
+selfcheckgpt/modeling_selfcheck_apiprompt.py
+selfcheckgpt/utils.py
+selfcheckgpt/version.py
+selfcheckgpt.egg-info/PKG-INFO
+selfcheckgpt.egg-info/SOURCES.txt
+selfcheckgpt.egg-info/dependency_links.txt
+selfcheckgpt.egg-info/requires.txt
+selfcheckgpt.egg-info/top_level.txt
