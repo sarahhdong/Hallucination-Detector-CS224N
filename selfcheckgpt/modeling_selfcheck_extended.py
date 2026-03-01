@@ -9,7 +9,7 @@ logging.set_verbosity_error()
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 from transformers import LongformerTokenizer, LongformerForMultipleChoice, LongformerForSequenceClassification
-from transformers import DebertaV2ForSequenceClassification, DebertaV2Tokenizer
+from transformers import DebertaV2ForSequenceClassification, AutoTokenizer
 from selfcheckgpt.utils import MQAGConfig, expand_list1, expand_list2, NLIConfig, LLMPromptConfig
 from selfcheckgpt.modeling_mqag import question_generation_sentence_level, answering
 from selfcheckgpt.modeling_ngram import UnigramModel, NgramModel
@@ -337,11 +337,49 @@ class SelfCheckNLI:
         batch_size: int = 32
     ):
         nli_model = nli_model if nli_model is not None else NLIConfig.nli_model
-        self.tokenizer = DebertaV2Tokenizer.from_pretrained(nli_model)
+        
+        # Use AutoTokenizer for more robust loading (handles different tokenizer types)
+        # AutoTokenizer automatically selects the correct tokenizer class
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(nli_model, trust_remote_code=True)
+        except Exception as e:
+            error_msg = str(e)
+            if "sentencepiece" in error_msg.lower() or "protobuf" in error_msg.lower() or "spm.model" in error_msg.lower():
+                print(f"\n❌ Error loading tokenizer: {error_msg}")
+                print("\n🔧 Troubleshooting steps:")
+                print("1. Install required dependencies:")
+                print("   pip install sentencepiece protobuf")
+                print("2. Clear corrupted cache:")
+                print("   rm -rf ~/.cache/huggingface/hub/models--potsawee--deberta-v3-large-mnli")
+                print("3. Then re-run the script")
+                print("\n   Or use a different model:")
+                print("   python train_on_wikibio.py --nli_model microsoft/deberta-v3-base --output model.pkl")
+            raise
+        
         self.model = DebertaV2ForSequenceClassification.from_pretrained(nli_model)
         self.model.eval()
+        
+        # Validate and set device (ensure CUDA is actually available if requested)
         if device is None:
             device = torch.device("cpu")
+        elif isinstance(device, str):
+            # Convert string to device, with CUDA validation
+            device_str = device.lower().strip()
+            if device_str == "cuda" or device_str.startswith("cuda"):
+                if torch.cuda.is_available():
+                    device = torch.device("cuda")
+                else:
+                    print("⚠️  Warning: CUDA requested but not available. Using CPU instead.")
+                    device = torch.device("cpu")
+            else:
+                device = torch.device(device_str)
+        elif isinstance(device, torch.device):
+            # Already a device object - validate CUDA
+            if device.type == "cuda" and not torch.cuda.is_available():
+                print("⚠️  Warning: CUDA device object passed but CUDA not available. Using CPU instead.")
+                device = torch.device("cpu")
+        
+        # Move model to device (now guaranteed to be valid)
         self.model.to(device)
         self.device = device
         self.batch_size = batch_size
@@ -364,9 +402,48 @@ class SelfCheckNLI:
             elif 'contradict' in label_lower:
                 self.contradiction_idx = idx
         
-        # Validate we found the expected labels
+        # Fallback: If labels are generic (LABEL_0, LABEL_1, etc.), use standard NLI ordering
+        # Standard MultiNLI ordering: 0=entailment, 1=neutral, 2=contradiction
         if self.entailment_idx is None or self.contradiction_idx is None:
-            raise ValueError(f"Could not find entailment/contradiction labels in model. Available labels: {list(self.id2label.values())}")
+            num_labels = len(self.id2label)
+            labels_list = list(self.id2label.values())
+            
+            # Check if all labels are generic (LABEL_0, LABEL_1, etc.)
+            all_generic = all(label.upper().startswith('LABEL_') for label in labels_list)
+            
+            if all_generic and num_labels >= 2:
+                print(f"⚠️  Warning: Model uses generic labels {labels_list}. Assuming standard NLI ordering.")
+                if num_labels == 2:
+                    # Binary NLI: assume 0=entailment, 1=contradiction
+                    self.entailment_idx = 0
+                    self.contradiction_idx = 1
+                    self.neutral_idx = None
+                    print(f"   Binary NLI: E=LABEL_0(0), C=LABEL_1(1), N=None")
+                elif num_labels == 3:
+                    # Standard 3-class NLI: 0=entailment, 1=neutral, 2=contradiction
+                    self.entailment_idx = 0
+                    self.neutral_idx = 1
+                    self.contradiction_idx = 2
+                    print(f"   3-class NLI: E=LABEL_0(0), N=LABEL_1(1), C=LABEL_2(2)")
+                else:
+                    # For other cases, try to infer from position
+                    # Common pattern: first=entailment, last=contradiction, middle=neutral
+                    sorted_indices = sorted(self.id2label.keys())
+                    if len(sorted_indices) >= 2:
+                        self.entailment_idx = sorted_indices[0]
+                        self.contradiction_idx = sorted_indices[-1]
+                        if len(sorted_indices) == 3:
+                            self.neutral_idx = sorted_indices[1]
+                        print(f"   Inferred: E={sorted_indices[0]}, C={sorted_indices[-1]}, N={sorted_indices[1] if len(sorted_indices)==3 else None}")
+            else:
+                # Could not infer - raise error with helpful message
+                raise ValueError(
+                    f"Could not find entailment/contradiction labels in model.\n"
+                    f"Available labels: {labels_list}\n"
+                    f"Expected labels containing 'entail'/'entailment' and 'contradict'/'contradiction'.\n"
+                    f"If using generic labels (LABEL_0, LABEL_1, etc.), the model should have 2-3 classes.\n"
+                    f"Current model has {num_labels} classes."
+                )
         
         print(f"SelfCheck-NLI initialized to device {device}")
         neutral_info = f"N={self.id2label[self.neutral_idx]}({self.neutral_idx})" if self.neutral_idx is not None else "N=None"
