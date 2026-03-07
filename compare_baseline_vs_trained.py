@@ -261,13 +261,14 @@ def main():
                         help='Test split ratio (must match training)')
     parser.add_argument('--random_seed', type=int, default=42,
                         help='Random seed (must match training)')
-    parser.add_argument('--split_by_doc', action='store_true',
-                        help='Split by document (must match training)')
+    parser.add_argument('--no_split_by_doc', action='store_true',
+                        help='Use sentence-level split (default: split by document to match training)')
     parser.add_argument('--skip_baseline', action='store_true',
                         help='Skip baseline evaluation (only evaluate trained model)')
     
     args = parser.parse_args()
-    
+    args.split_by_doc = not args.no_split_by_doc
+
     # Setup device
     if args.device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -4,13 +4,11 @@ Training script for supervised hallucination detection on WikiBio GPT-3 Hallucin
 This script:
 1. Loads data from Hugging Face dataset: potsawee/wiki_bio_gpt3_hallucination
 2. Flattens sentences and converts annotations to binary labels
-   - Accurate → 0 (factual)
-   - Minor Inaccurate → 1 (non-factual/hallucinated)
-   - Major Inaccurate → 1 (non-factual/hallucinated)
-3. Extracts 7 contradiction-derived features using SelfCheckNLI
-4. Splits data: 70% train, 30% test (default)
-5. Trains a logistic regression classifier
-6. Evaluates on test set and saves the model
+   - Accurate → 0 (factual), Minor/Major Inaccurate → 1 (hallucinated)
+3. Extracts NLI-derived features (entailment, contradiction, margins, etc.) using SelfCheckNLI
+4. Default: document-level split (--no_split_by_doc for sentence-level)
+5. Optional: k-fold CV (--cv_folds 5) and C tuning (--tune_C) for stable AUC-PR and better regularization
+6. Trains logistic regression and saves the model
 """
 
 import numpy as np
@@ -22,8 +20,9 @@ from pathlib import Path
 from datasets import load_dataset
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, 
-    f1_score, roc_auc_score, classification_report, confusion_matrix
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, average_precision_score,
+    classification_report, confusion_matrix
 )
 import torch
 
@@ -117,7 +116,7 @@ def extract_features(sentences, sampled_passages, doc_indices, nli_model, device
         cache_key: Optional cache key (auto-generated if None)
     
     Returns:
-        features: numpy array of shape (num_sentences, 7)
+        features: numpy array of shape (num_sentences, num_features)
     """
     # Try to load from cache
     if cache_dir is not None:
@@ -293,14 +292,16 @@ def train_model(X_train, y_train, X_test, y_test, C=1.0, max_iter=1000):
     y_pred = model.predict(X_test)
     y_pred_proba = model.predict_proba(X_test)[:, 1]
     
+    pr_auc = average_precision_score(y_test, y_pred_proba) if len(np.unique(y_test)) > 1 else 0.0
     metrics = {
         'accuracy': accuracy_score(y_test, y_pred),
         'precision': precision_score(y_test, y_pred, zero_division=0),
         'recall': recall_score(y_test, y_pred, zero_division=0),
         'f1': f1_score(y_test, y_pred, zero_division=0),
         'roc_auc': roc_auc_score(y_test, y_pred_proba) if len(np.unique(y_test)) > 1 else 0.0,
+        'pr_auc': pr_auc,
     }
-    
+
     print("\n" + "="*60)
     print("TEST SET METRICS:")
     print("="*60)
@@ -309,6 +310,7 @@ def train_model(X_train, y_train, X_test, y_test, C=1.0, max_iter=1000):
     print(f"  Recall:    {metrics['recall']:.4f}")
     print(f"  F1 Score:  {metrics['f1']:.4f}")
     print(f"  ROC-AUC:   {metrics['roc_auc']:.4f}")
+    print(f"  AUC-PR:    {metrics['pr_auc']:.4f}")
     
     print("\nClassification Report:")
     print(classification_report(y_test, y_pred, target_names=['Factual', 'Hallucinated']))
@@ -327,20 +329,21 @@ def save_model(model, output_path, feature_names=None):
     Args:
         model: Trained LogisticRegression model
         output_path: Path to save model
-        feature_names: Optional list of feature names
+        feature_names: Optional list of feature names (from NLI feature set)
     """
+    if feature_names is None:
+        try:
+            n_f = model.coef_.shape[1]
+            feature_names = [f"feature_{i}" for i in range(n_f)]
+        except Exception:
+            feature_names = []
     model_data = {
         'model': model,
-        'feature_names': feature_names or [
-            'mean(C)', 'max(C)', 'std(C)', 'frac(C>0.5)', 
-            'entropy(C)', 'iqr(C)', 'top3_mean(C)'
-        ],
-        'num_features': 7
+        'feature_names': feature_names,
+        'num_features': len(feature_names),
     }
-    
     with open(output_path, 'wb') as f:
         pickle.dump(model_data, f)
-    
     print(f"\nModel saved to {output_path}")
 
 
@@ -362,12 +365,17 @@ def main():
                         help='Maximum iterations for logistic regression')
     parser.add_argument('--random_seed', type=int, default=42,
                         help='Random seed for reproducibility')
-    parser.add_argument('--split_by_doc', action='store_true',
-                        help='Split by document (ensures sentences from same doc in same split)')
+    parser.add_argument('--no_split_by_doc', action='store_true',
+                        help='Use sentence-level split (default: split by document to avoid leakage)')
+    parser.add_argument('--cv_folds', type=int, default=0,
+                        help='K-fold CV at document level (e.g. 5). 0 = single train/test split.')
+    parser.add_argument('--tune_C', action='store_true',
+                        help='Grid-search C over [0.01, 0.1, 1.0, 10.0] using CV; use with --cv_folds >= 2')
     parser.add_argument('--cache_dir', type=str, default='.feature_cache',
                         help='Directory to cache extracted features (speeds up re-runs). Set to empty string to disable caching.')
     
     args = parser.parse_args()
+    args.split_by_doc = not args.no_split_by_doc
     
     # Set random seeds
     np.random.seed(args.random_seed)
@@ -397,7 +405,98 @@ def main():
     
     # Load data
     sentences, labels, sampled_passages, doc_indices = load_wikibio_data()
-    
+    doc_indices = np.array(doc_indices)
+
+    # When using CV, we need features for all data first (no split yet)
+    use_cv = args.cv_folds >= 2
+    if args.tune_C and not use_cv:
+        args.cv_folds = 5
+        use_cv = True
+        print(f"  C tuning requested: using {args.cv_folds}-fold CV for selection")
+
+    # Initialize NLI model (needed for feature extraction in both branches)
+    print("\nInitializing SelfCheckNLI model...")
+    effective_batch_size = args.batch_size
+    if device.type == 'cuda':
+        effective_batch_size = max(args.batch_size, 64)
+        print(f"GPU detected: using batch_size={effective_batch_size}")
+    nli_model = SelfCheckNLI(
+        nli_model=args.nli_model,
+        device=device,
+        batch_size=effective_batch_size
+    )
+    cache_dir = args.cache_dir if args.cache_dir else None
+
+    if use_cv:
+        # Extract features for ALL sentences once
+        print("\nExtracting features for full dataset (for CV)...")
+        X_all = extract_features(
+            sentences, sampled_passages, doc_indices, nli_model, device, args.batch_size,
+            cache_dir=cache_dir, cache_key='full'
+        )
+        y_all = np.array(labels)
+        unique_docs = np.unique(doc_indices)
+        doc_labels = np.array([
+            int(np.bincount(labels[doc_indices == d]).argmax()) for d in unique_docs
+        ])
+        from sklearn.model_selection import StratifiedKFold
+        kf = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=args.random_seed)
+        doc_to_sent_idx = {}
+        for i, d in enumerate(doc_indices):
+            doc_to_sent_idx.setdefault(d, []).append(i)
+        fold_doc_splits = list(kf.split(unique_docs, doc_labels))
+
+        C_candidates = [0.01, 0.1, 1.0, 10.0] if args.tune_C else [args.C]
+        best_C = args.C
+        best_mean_pr = -1.0
+        cv_results = []
+
+        for C in C_candidates:
+            fold_pr_aucs = []
+            for fold_idx, (train_doc_idx, test_doc_idx) in enumerate(fold_doc_splits):
+                train_docs = set(unique_docs[train_doc_idx])
+                test_docs = set(unique_docs[test_doc_idx])
+                train_sent_idx = [i for i in range(len(sentences)) if doc_indices[i] in train_docs]
+                test_sent_idx = [i for i in range(len(sentences)) if doc_indices[i] in test_docs]
+                X_tr, y_tr = X_all[train_sent_idx], y_all[train_sent_idx]
+                X_te, y_te = X_all[test_sent_idx], y_all[test_sent_idx]
+                model_fold = LogisticRegression(
+                    C=C, max_iter=args.max_iter, random_state=42, solver='lbfgs', class_weight='balanced'
+                )
+                model_fold.fit(X_tr, y_tr)
+                proba = model_fold.predict_proba(X_te)[:, 1]
+                pr = average_precision_score(y_te, proba) if len(np.unique(y_te)) > 1 else 0.0
+                fold_pr_aucs.append(pr)
+            mean_pr = np.mean(fold_pr_aucs)
+            std_pr = np.std(fold_pr_aucs)
+            cv_results.append((C, mean_pr, std_pr, fold_pr_aucs))
+            if mean_pr > best_mean_pr:
+                best_mean_pr = mean_pr
+                best_C = C
+            print(f"  C={C:.2f}  AUC-PR (mean ± std): {mean_pr:.4f} ± {std_pr:.4f}")
+
+        print("\n" + "="*60)
+        print("CROSS-VALIDATION RESULTS")
+        print("="*60)
+        for C, mean_pr, std_pr, _ in cv_results:
+            print(f"  C={C:.2f}: AUC-PR = {mean_pr:.4f} ± {std_pr:.4f}")
+        if args.tune_C:
+            print(f"  Best C (by AUC-PR): {best_C}")
+        print("="*60)
+
+        # Train final model on full dataset with best C
+        print(f"\nTraining final model on full dataset with C={best_C}...")
+        model = LogisticRegression(
+            C=best_C, max_iter=args.max_iter, random_state=42, solver='lbfgs', class_weight='balanced'
+        )
+        model.fit(X_all, y_all)
+        output_path = Path(args.output)
+        feature_names = getattr(nli_model, 'feature_names', None)
+        save_model(model, output_path, feature_names=feature_names)
+        print("\nTraining complete! (Final model trained on all data with best C.)")
+        return
+
+    # Single train/test split path below
     # Split data
     if args.split_by_doc:
         # Split by document to ensure sentences from same doc stay together
@@ -462,10 +561,10 @@ def main():
         y_test = labels[test_indices]
         train_sampled = [sampled_passages[i] for i in train_indices]
         test_sampled = [sampled_passages[i] for i in test_indices]
-        train_doc_indices = [doc_indices[i] for i in train_indices]
-        test_doc_indices = [doc_indices[i] for i in test_indices]
+        train_doc_indices = list(doc_indices[train_indices])
+        test_doc_indices = list(doc_indices[test_indices])
         
-        print(f"\nRandom split (stratified):")
+        print(f"\nRandom split (stratified, sentence-level):")
         print(f"  Train sentences: {len(train_sentences)}")
         print(f"  Test sentences: {len(test_sentences)}")
     
@@ -475,25 +574,6 @@ def main():
     print(f"  Train - Non-factual (1): {np.sum(y_train == 1)} ({np.mean(y_train == 1)*100:.1f}%)")
     print(f"  Test - Factual (0): {np.sum(y_test == 0)} ({np.mean(y_test == 0)*100:.1f}%)")
     print(f"  Test - Non-factual (1): {np.sum(y_test == 1)} ({np.mean(y_test == 1)*100:.1f}%)")
-    
-    # Initialize NLI model
-    print("\nInitializing SelfCheckNLI model...")
-    
-    # Increase batch size if GPU is available (faster processing)
-    effective_batch_size = args.batch_size
-    if device.type == 'cuda':
-        # Use larger batches on GPU
-        effective_batch_size = max(args.batch_size, 64)
-        print(f"GPU detected: using batch_size={effective_batch_size} (increased from {args.batch_size})")
-    
-    nli_model = SelfCheckNLI(
-        nli_model=args.nli_model,
-        device=device,
-        batch_size=effective_batch_size
-    )
-    
-    # Setup cache directory
-    cache_dir = args.cache_dir if args.cache_dir else None
     
     # Extract features for training set
     print("\n" + "="*60)
@@ -519,9 +599,10 @@ def main():
         C=args.C, max_iter=args.max_iter
     )
     
-    # Save model
+    # Save model (include feature names from NLI)
     output_path = Path(args.output)
-    save_model(model, output_path)
+    feature_names = getattr(nli_model, 'feature_names', None)
+    save_model(model, output_path, feature_names=feature_names)
     
     print("\n" + "="*60)
     print("Training complete!")
