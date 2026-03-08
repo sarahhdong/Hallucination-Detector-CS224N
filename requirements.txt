@@ -1,0 +1,22 @@
+# Core (from setup.py)
+# NumPy: 2.x breaks older PyTorch/compiled libs; keep 1.x
+numpy>=1.21,<2
+torch>=1.12
+# Pin transformers<4.45 so PyTorch 2.2.x works (newer versions require torch>=2.4 and disable PyTorch otherwise)
+transformers>=4.35,<4.45
+sentencepiece
+protobuf
+bert_score
+spacy
+nltk
+openai
+groq
+
+# Training & evaluation scripts
+datasets
+scikit-learn
+matplotlib
+tqdm
+
+# Optional: faster training comparison in train_expanded_model.py
+# pip install xgboost

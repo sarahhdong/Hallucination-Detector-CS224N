@@ -5,14 +5,20 @@ with open('DESCRIPTION.txt') as file:
     long_description = file.read()
 
 REQUIREMENTS = [
-    "transformers>=4.35",
+    "numpy>=1.21,<2",
     "torch>=1.12",
-    "numpy",
+    "transformers>=4.35,<4.45",  # 4.45+ requires torch>=2.4 (not on all platforms)
+    "sentencepiece",
+    "protobuf",
     "bert_score",
     "spacy",
     "nltk",
     "openai",
     "groq",
+    "datasets",
+    "scikit-learn",
+    "matplotlib",
+    "tqdm",
 ]
 
 # some more details
