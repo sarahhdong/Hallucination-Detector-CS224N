@@ -7,6 +7,7 @@ Computes AUC-PR (Area Under Precision-Recall Curve) for both methods.
 import numpy as np
 import pickle
 import argparse
+import json
 from pathlib import Path
 from datasets import load_dataset
 from sklearn.metrics import (
@@ -172,7 +173,38 @@ def evaluate_baseline(test_sentences, test_sampled_passages, test_labels, nli_mo
     }
 
 
-def evaluate_trained(test_sentences, test_sampled_passages, test_labels, model_path, nli_model, device, batch_size=32):
+def compute_metrics_from_scores(test_labels, scores):
+    """Compute baseline metrics from cached or freshly computed baseline scores."""
+    predictions = (scores > 0.5).astype(int)
+    accuracy = accuracy_score(test_labels, predictions)
+    precision = precision_score(test_labels, predictions, zero_division=0)
+    recall = recall_score(test_labels, predictions, zero_division=0)
+    f1 = f1_score(test_labels, predictions, zero_division=0)
+    try:
+        roc_auc = roc_auc_score(test_labels, scores)
+    except Exception:
+        roc_auc = 0.0
+    pr_auc = average_precision_score(test_labels, scores)
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'roc_auc': roc_auc,
+        'pr_auc': pr_auc
+    }
+
+
+def evaluate_trained(
+    test_sentences,
+    test_sampled_passages,
+    test_labels,
+    model_path,
+    nli_model,
+    device,
+    batch_size=32,
+    cached_features=None,
+):
     """
     Evaluate trained supervised model.
     
@@ -191,24 +223,28 @@ def evaluate_trained(test_sentences, test_sampled_passages, test_labels, model_p
         feature_names = model_data['feature_names']
     print(f"Model loaded. Features: {feature_names}")
     
-    # Initialize extended NLI model for feature extraction
-    extended_nli = SelfCheckNLIExtended(nli_model=nli_model, device=device, batch_size=batch_size)
-    
-    # Extract features
-    # Note: extract_features expects sampled_passages to be a list of strings (shared),
-    # but we have a list of lists (one per sentence). Process each sentence individually.
-    print(f"Extracting features for {len(test_sentences)} sentences...")
-    
-    all_features = []
-    for i, (sent, passages) in enumerate(zip(test_sentences, test_sampled_passages)):
-        # Extract features for this sentence with its passages
-        sent_features = extended_nli.extract_features([sent], passages)
-        all_features.append(sent_features[0])  # Get single feature vector
+    if cached_features is not None:
+        print(f"Using cached test features: shape={cached_features.shape}")
+        features = cached_features
+    else:
+        # Initialize extended NLI model for feature extraction
+        extended_nli = SelfCheckNLIExtended(nli_model=nli_model, device=device, batch_size=batch_size)
         
-        if (i + 1) % 50 == 0:
-            print(f"  Processed {i + 1}/{len(test_sentences)} sentences...")
-    
-    features = np.array(all_features)
+        # Extract features
+        # Note: extract_features expects sampled_passages to be a list of strings (shared),
+        # but we have a list of lists (one per sentence). Process each sentence individually.
+        print(f"Extracting features for {len(test_sentences)} sentences...")
+        
+        all_features = []
+        for i, (sent, passages) in enumerate(zip(test_sentences, test_sampled_passages)):
+            # Extract features for this sentence with its passages
+            sent_features = extended_nli.extract_features([sent], passages)
+            all_features.append(sent_features[0])  # Get single feature vector
+            
+            if (i + 1) % 50 == 0:
+                print(f"  Processed {i + 1}/{len(test_sentences)} sentences...")
+        
+        features = np.array(all_features)
     
     # Predict
     predictions = classifier.predict(features)
@@ -265,6 +301,8 @@ def main():
                         help='Use sentence-level split (default: split by document to match training)')
     parser.add_argument('--skip_baseline', action='store_true',
                         help='Skip baseline evaluation (only evaluate trained model)')
+    parser.add_argument('--cache_dir', type=str, default='.feature_cache',
+                        help='Directory containing cached features (features_test.npz). Set to empty string to disable.')
     
     args = parser.parse_args()
     args.split_by_doc = not args.no_split_by_doc
@@ -291,20 +329,92 @@ def main():
         split_by_doc=args.split_by_doc
     )
     
+    # Resolve cache directory once
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
     # Evaluate baseline (if not skipped)
     if not args.skip_baseline:
-        baseline_scores, baseline_metrics = evaluate_baseline(
-            test_sentences, test_sampled_passages, test_labels,
-            args.nli_model, device, args.batch_size
-        )
+        baseline_scores = None
+        baseline_cache_file = None
+        baseline_meta_file = None
+        if cache_dir is not None:
+            baseline_cache_file = cache_dir / 'baseline_scores_test.npz'
+            baseline_meta_file = cache_dir / 'baseline_scores_test.json'
+            if baseline_cache_file.exists():
+                try:
+                    cached_scores = np.load(baseline_cache_file)['scores']
+                    if len(cached_scores) == len(test_labels):
+                        baseline_scores = cached_scores
+                        print(f"✅ Loaded cached baseline scores from {baseline_cache_file}")
+                    else:
+                        print(
+                            f"⚠️  Cached baseline score count mismatch: "
+                            f"{len(cached_scores)} vs {len(test_labels)} labels. Recomputing baseline."
+                        )
+                except Exception as e:
+                    print(f"⚠️  Could not load cached baseline scores ({e}). Recomputing baseline.")
+
+        if baseline_scores is None:
+            baseline_scores, _ = evaluate_baseline(
+                test_sentences, test_sampled_passages, test_labels,
+                args.nli_model, device, args.batch_size
+            )
+            if baseline_cache_file is not None:
+                try:
+                    np.savez_compressed(baseline_cache_file, scores=baseline_scores)
+                    with open(baseline_meta_file, 'w') as f:
+                        json.dump({
+                            'num_test_sentences': len(test_labels),
+                            'test_size': args.test_size,
+                            'random_seed': args.random_seed,
+                            'split_by_doc': args.split_by_doc,
+                            'nli_model': args.nli_model or 'default',
+                        }, f, indent=2)
+                    print(f"💾 Saved baseline scores to cache: {baseline_cache_file}")
+                except Exception as e:
+                    print(f"⚠️  Could not save baseline scores cache: {e}")
+
+        baseline_metrics = compute_metrics_from_scores(test_labels, baseline_scores)
+        print(f"\nBaseline Metrics:")
+        print(f"  Accuracy:  {baseline_metrics['accuracy']:.4f}")
+        print(f"  Precision: {baseline_metrics['precision']:.4f}")
+        print(f"  Recall:    {baseline_metrics['recall']:.4f}")
+        print(f"  F1 Score:  {baseline_metrics['f1']:.4f}")
+        print(f"  ROC-AUC:   {baseline_metrics['roc_auc']:.4f}")
+        print(f"  AUC-PR:    {baseline_metrics['pr_auc']:.4f}")
     else:
         baseline_metrics = None
         print("\n⚠️  Skipping baseline evaluation (--skip_baseline flag set)")
     
+    # Try loading cached test features for trained-model evaluation
+    cached_test_features = None
+    if cache_dir is not None:
+        test_cache_file = cache_dir / 'features_test.npz'
+        if test_cache_file.exists():
+            try:
+                cached_test_features = np.load(test_cache_file)['features']
+                if len(cached_test_features) != len(test_labels):
+                    print(
+                        f"⚠️  Cached test feature count mismatch: "
+                        f"{len(cached_test_features)} vs {len(test_labels)} labels. "
+                        "Falling back to on-the-fly extraction."
+                    )
+                    cached_test_features = None
+                else:
+                    print(f"✅ Loaded cached test features from {test_cache_file}")
+            except Exception as e:
+                print(f"⚠️  Could not load cached test features ({e}). Falling back to extraction.")
+                cached_test_features = None
+        else:
+            print(f"ℹ️  No cached test features found at {test_cache_file}. Falling back to extraction.")
+
     # Evaluate trained model
     trained_probs, trained_metrics = evaluate_trained(
         test_sentences, test_sampled_passages, test_labels,
-        args.model, args.nli_model, device, args.batch_size
+        args.model, args.nli_model, device, args.batch_size,
+        cached_features=cached_test_features
     )
     
     # Comparison (if baseline was evaluated)

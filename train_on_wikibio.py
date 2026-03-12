@@ -1,14 +1,5 @@
 """
-Training script for supervised hallucination detection on WikiBio GPT-3 Hallucination dataset.
-
-This script:
-1. Loads data from Hugging Face dataset: potsawee/wiki_bio_gpt3_hallucination
-2. Flattens sentences and converts annotations to binary labels
-   - Accurate → 0 (factual), Minor/Major Inaccurate → 1 (hallucinated)
-3. Extracts NLI-derived features (entailment, contradiction, margins, etc.) using SelfCheckNLI
-4. Default: document-level split (--no_split_by_doc for sentence-level)
-5. Optional: k-fold CV (--cv_folds 5) and C tuning (--tune_C) for stable AUC-PR and better regularization
-6. Trains logistic regression and saves the model
+train logistic regression model on Wikibio dataset.
 """
 
 import numpy as np
@@ -30,70 +21,52 @@ from selfcheckgpt.modeling_selfcheck_extended import SelfCheckNLI
 
 
 def load_wikibio_data():
-    """
-    Load WikiBio GPT-3 Hallucination dataset from Hugging Face.
-    
-    Returns:
-        all_sentences: List of all sentences (flattened)
-        all_labels: Array of binary labels (0=factual, 1=hallucinated)
-        all_sampled_passages: List of sampled passages (same for all sentences in a document)
-        doc_indices: List mapping each sentence to its document index
-    """
+    # load wiki bio data set
     print("Loading WikiBio GPT-3 Hallucination dataset from Hugging Face...")
     dataset = load_dataset("potsawee/wiki_bio_gpt3_hallucination")
     dataset = dataset['evaluation']
     
-    all_sentences = []
-    all_labels = []
-    all_sampled_passages = []
+    sentences = []
+    labels = []
+    passages = []
     doc_indices = []
     
-    # Label mapping: 
-    # - Accurate → 0 (factual)
-    # - Minor Inaccurate → 1 (non-factual/hallucinated)
-    # - Major Inaccurate → 1 (non-factual/hallucinated)
     label_mapping = {
-        'accurate': 0,           # Factual
-        'minor_inaccurate': 1,   # Non-factual (hallucinated)
-        'major_inaccurate': 1    # Non-factual (hallucinated)
+        'accurate': 0,           
+        'minor_inaccurate': 1,   
+        'major_inaccurate': 1    
     }
     
     for doc_idx, example in enumerate(dataset):
         sentences = example['gpt3_sentences']
         annotations = example['annotation']
-        sampled_passages = example['gpt3_text_samples']  # List of 20 sampled passages
+        passages = example['gpt3_text_samples']  # List of 20 sampled passages
         
-        # Flatten: each sentence gets its own entry
         for sent_idx, (sentence, annotation) in enumerate(zip(sentences, annotations)):
-            all_sentences.append(sentence)
-            all_labels.append(label_mapping[annotation])
-            all_sampled_passages.append(sampled_passages)  # Same passages for all sentences in doc
+            sentences.append(sentence)
+            labels.append(label_mapping[annotation])
+            passages.append(passages)  # Same passages for all sentences in doc
             doc_indices.append(doc_idx)
     
     all_labels = np.array(all_labels)
     
     print(f"\nDataset Statistics:")
     print(f"  Total documents: {len(dataset)}")
-    print(f"  Total sentences: {len(all_sentences)}")
+    print(f"  Total sentences: {len(sentences)}")
     print(f"  Label distribution:")
-    print(f"    Factual (0): {np.sum(all_labels == 0)} ({np.mean(all_labels == 0)*100:.1f}%)")
-    print(f"    Non-factual/Hallucinated (1): {np.sum(all_labels == 1)} ({np.mean(all_labels == 1)*100:.1f}%)")
-    print(f"  Sampled passages per sentence: {len(all_sampled_passages[0])}")
-    print(f"\nLabel mapping:")
-    print(f"  'accurate' → 0 (factual)")
-    print(f"  'minor_inaccurate' → 1 (non-factual)")
-    print(f"  'major_inaccurate' → 1 (non-factual)")
+    print(f"    Factual (0): {np.sum(labels == 0)} ({np.mean(labels == 0)*100:.1f}%)")
+    print(f"    Non-factual/Hallucinated (1): {np.sum(labels == 1)} ({np.mean(labels == 1)*100:.1f}%)")
+    print(f"  Sampled passages per sentence: {len(passages[0])}")
     
-    return all_sentences, all_labels, all_sampled_passages, doc_indices
+    return sentences, all_labels, passages, doc_indices
 
 
-def compute_cache_key(sentences, sampled_passages, nli_model_name, batch_size):
-    """Compute a hash key for caching features."""
-    # Create a string representation of the data
+def compute_cache_key(sentences, passages, nli_model_name, batch_size):
+    # need hash key for caching
     data_str = json.dumps({
-        'sentences': sentences[:10],  # First 10 for quick check
+        'sentences': sentences[:10],  
         'num_sentences': len(sentences),
-        'num_passages_per_sent': len(sampled_passages[0]) if sampled_passages else 0,
+        'num_passages_per_sent': len(passages[0]) if passages else 0,
         'nli_model': nli_model_name,
         'batch_size': batch_size
     }, sort_keys=True)
@@ -101,23 +74,7 @@ def compute_cache_key(sentences, sampled_passages, nli_model_name, batch_size):
 
 
 def extract_features(sentences, sampled_passages, doc_indices, nli_model, device, batch_size=32, cache_dir=None, cache_key=None):
-    """
-    Extract contradiction-derived features for all sentences.
-    Supports caching to avoid re-extraction on subsequent runs.
-    
-    Args:
-        sentences: List of sentences
-        sampled_passages: List of lists (each inner list has sampled passages for that sentence)
-        doc_indices: List mapping each sentence to its document index
-        nli_model: SelfCheckNLI model instance
-        device: torch device
-        batch_size: Batch size for processing
-        cache_dir: Directory to save/load cached features (None to disable caching)
-        cache_key: Optional cache key (auto-generated if None)
-    
-    Returns:
-        features: numpy array of shape (num_sentences, num_features)
-    """
+    # extract features for all sentences. caching supported.
     # Try to load from cache
     if cache_dir is not None:
         cache_dir = Path(cache_dir)
@@ -128,29 +85,24 @@ def extract_features(sentences, sampled_passages, doc_indices, nli_model, device
             cache_key = compute_cache_key(sentences, sampled_passages, nli_model_name, batch_size)
         
         cache_file = cache_dir / f"features_{cache_key}.npz"
-        cache_meta_file = cache_dir / f"features_{cache_key}.json"
+        cache_meta = cache_dir / f"features_{cache_key}.json"
         
-        if cache_file.exists() and cache_meta_file.exists():
+        if cache_file.exists() and cache_meta.exists():
             try:
-                print(f"\n📦 Loading cached features from {cache_file}...")
+                print(f"\nLoading cached features from {cache_file}...")
                 data = np.load(cache_file)
                 features = data['features']
-                
-                # Verify cache is valid
-                with open(cache_meta_file, 'r') as f:
+                with open(cache_meta, 'r') as f:
                     meta = json.load(f)
                 if meta['num_sentences'] == len(sentences):
-                    print(f"✅ Loaded {len(features)} cached feature vectors")
+                    print(f"Loaded {len(features)} cached feature vectors")
                     return features
                 else:
-                    print(f"⚠️  Cache mismatch (expected {meta['num_sentences']} sentences, got {len(sentences)}). Re-extracting...")
+                    print(f"Cache mismatch (expected {meta['num_sentences']} sentences, got {len(sentences)}). Re-extracting...")
             except Exception as e:
-                print(f"⚠️  Error loading cache: {e}. Re-extracting...")
-    
-    # Extract features (cache miss or cache disabled)
+                print(f"Error loading cache: {e}. Re-extracting...")
+
     print("\nExtracting features...")
-    
-    # Group sentences by document (sentences in same doc share sampled passages)
     from collections import defaultdict
     doc_to_sentences = defaultdict(list)
     doc_to_passages = {}
@@ -158,20 +110,16 @@ def extract_features(sentences, sampled_passages, doc_indices, nli_model, device
     
     for idx, (sent, passages, doc_idx) in enumerate(zip(sentences, sampled_passages, doc_indices)):
         doc_to_sentences[doc_idx].append(sent)
-        doc_to_passages[doc_idx] = passages  # Same for all sentences in doc
+        doc_to_passages[doc_idx] = passages  
         doc_to_indices[doc_idx].append(idx)
     
-    # Process each document's sentences together (they share sampled passages)
     all_features = [None] * len(sentences)
     
     num_docs = len(doc_to_sentences)
     print(f"Processing {num_docs} documents...")
-    
-    # Use parallel processing for CPU, sequential for GPU (GPU can't be shared across processes)
     use_gpu = str(nli_model.device) != 'cpu'
     
     if num_docs > 1 and not use_gpu:
-        # CPU: Use parallel processing
         try:
             from joblib import Parallel, delayed
             from tqdm import tqdm
@@ -182,8 +130,7 @@ def extract_features(sentences, sampled_passages, doc_indices, nli_model, device
                 doc_sentence_indices = doc_to_indices[doc_idx]
                 doc_features = nli_model.extract_features(doc_sentences, doc_passages)
                 return doc_sentence_indices, doc_features
-            
-            # Use multiple workers for CPU (but not too many to avoid memory issues)
+        
             n_workers = min(4, num_docs)
             
             results = Parallel(n_jobs=n_workers)(
@@ -191,13 +138,11 @@ def extract_features(sentences, sampled_passages, doc_indices, nli_model, device
                 for doc_idx in tqdm(doc_to_sentences.keys(), desc="Extracting features")
             )
             
-            # Store features in original order
             for doc_sentence_indices, doc_features in results:
                 for feat_idx, orig_idx in enumerate(doc_sentence_indices):
                     all_features[orig_idx] = doc_features[feat_idx]
         except ImportError:
-            # Fallback to sequential if joblib not available
-            print("⚠️  joblib not available, processing sequentially...")
+            print("joblib not available, processing sequentially")
             from tqdm import tqdm
             for doc_idx in tqdm(doc_to_sentences.keys(), desc="Extracting features"):
                 doc_sentences = doc_to_sentences[doc_idx]
@@ -209,7 +154,6 @@ def extract_features(sentences, sampled_passages, doc_indices, nli_model, device
                 for feat_idx, orig_idx in enumerate(doc_sentence_indices):
                     all_features[orig_idx] = doc_features[feat_idx]
     else:
-        # GPU or single document: process sequentially with progress bar
         try:
             from tqdm import tqdm
             iterator = tqdm(doc_to_sentences.items(), desc="Extracting features")
@@ -228,7 +172,6 @@ def extract_features(sentences, sampled_passages, doc_indices, nli_model, device
     features = np.array(all_features)
     print(f"Extracted features shape: {features.shape}")
     
-    # Save to cache if enabled
     if cache_dir is not None:
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -241,7 +184,6 @@ def extract_features(sentences, sampled_passages, doc_indices, nli_model, device
         cache_meta_file = cache_dir / f"features_{cache_key}.json"
         
         try:
-            print(f"💾 Saving features to cache: {cache_file}")
             np.savez_compressed(cache_file, features=features)
             with open(cache_meta_file, 'w') as f:
                 json.dump({
@@ -250,29 +192,15 @@ def extract_features(sentences, sampled_passages, doc_indices, nli_model, device
                     'nli_model': getattr(nli_model, 'model_name', 'unknown'),
                     'batch_size': batch_size
                 }, f, indent=2)
-            print(f"✅ Features cached successfully")
+            print(f"cached successfully")
         except Exception as e:
-            print(f"⚠️  Warning: Could not save cache: {e}")
+            print(f"Could not save cache: {e}")
     
     return features
 
 
 def train_model(X_train, y_train, X_test, y_test, C=1.0, max_iter=1000):
-    """
-    Train logistic regression model and evaluate on test set.
-    
-    Args:
-        X_train: Training features (num_samples, 7)
-        y_train: Training labels (num_samples,)
-        X_test: Test features
-        y_test: Test labels
-        C: Regularization strength (inverse of regularization)
-        max_iter: Maximum iterations
-    
-    Returns:
-        model: Trained LogisticRegression model
-        metrics: Dictionary of test metrics
-    """
+    # train model
     print("\nTraining logistic regression...")
     print(f"Training set: {X_train.shape[0]} samples")
     print(f"Test set: {X_test.shape[0]} samples")
@@ -282,13 +210,12 @@ def train_model(X_train, y_train, X_test, y_test, C=1.0, max_iter=1000):
         C=C,
         max_iter=max_iter,
         random_state=42,
-        solver='lbfgs',  # Good for small datasets
-        class_weight='balanced'  # Handle class imbalance
+        solver='lbfgs',  
+        class_weight='balanced'  
     )
     
     model.fit(X_train, y_train)
     
-    # Evaluate on test set
     y_pred = model.predict(X_test)
     y_pred_proba = model.predict_proba(X_test)[:, 1]
     
@@ -312,10 +239,8 @@ def train_model(X_train, y_train, X_test, y_test, C=1.0, max_iter=1000):
     print(f"  ROC-AUC:   {metrics['roc_auc']:.4f}")
     print(f"  AUC-PR:    {metrics['pr_auc']:.4f}")
     
-    print("\nClassification Report:")
     print(classification_report(y_test, y_pred, target_names=['Factual', 'Hallucinated']))
     
-    print("\nConfusion Matrix:")
     print(confusion_matrix(y_test, y_pred))
     print("="*60)
     
@@ -323,14 +248,7 @@ def train_model(X_train, y_train, X_test, y_test, C=1.0, max_iter=1000):
 
 
 def save_model(model, output_path, feature_names=None):
-    """
-    Save trained model and metadata.
-    
-    Args:
-        model: Trained LogisticRegression model
-        output_path: Path to save model
-        feature_names: Optional list of feature names (from NLI feature set)
-    """
+    # save trained model for later 
     if feature_names is None:
         try:
             n_f = model.coef_.shape[1]
@@ -367,54 +285,44 @@ def main():
                         help='Random seed for reproducibility')
     parser.add_argument('--no_split_by_doc', action='store_true',
                         help='Use sentence-level split (default: split by document to avoid leakage)')
-    parser.add_argument('--cv_folds', type=int, default=0,
-                        help='K-fold CV at document level (e.g. 5). 0 = single train/test split.')
-    parser.add_argument('--tune_C', action='store_true',
-                        help='Grid-search C over [0.01, 0.1, 1.0, 10.0] using CV; use with --cv_folds >= 2')
+    # parser.add_argument('--cv_folds', type=int, default=0,
+    #                     help='K-fold CV at document level (e.g. 5). 0 = single train/test split.')
+    # parser.add_argument('--tune_C', action='store_true',
+    #                     help='Grid-search C over [0.01, 0.1, 1.0, 10.0] using CV; use with --cv_folds >= 2')
     parser.add_argument('--cache_dir', type=str, default='.feature_cache',
                         help='Directory to cache extracted features (speeds up re-runs). Set to empty string to disable caching.')
     
     args = parser.parse_args()
     args.split_by_doc = not args.no_split_by_doc
-    
-    # Set random seeds
     np.random.seed(args.random_seed)
     torch.manual_seed(args.random_seed)
-    
-    # Setup device with proper CUDA validation
+
     if args.device is None:
-        # Auto-detect: use CUDA if available, else CPU
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         requested_device = args.device.lower().strip()
-        # Check if CUDA is requested
         if requested_device == "cuda" or requested_device.startswith("cuda"):
             if torch.cuda.is_available():
                 device = torch.device("cuda")
             else:
-                print("⚠️  Warning: CUDA requested but not available. Falling back to CPU.")
+                print("Warning: CUDA requested but not available. Falling back to CPU.")
                 print("   (PyTorch was not compiled with CUDA support)")
                 device = torch.device("cpu")
         else:
-            # CPU or other device
             device = torch.device(requested_device)
     
     print(f"Using device: {device}")
     if device.type == "cuda":
         print(f"  CUDA device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
     
-    # Load data
     sentences, labels, sampled_passages, doc_indices = load_wikibio_data()
     doc_indices = np.array(doc_indices)
 
-    # When using CV, we need features for all data first (no split yet)
     use_cv = args.cv_folds >= 2
     if args.tune_C and not use_cv:
         args.cv_folds = 5
         use_cv = True
         print(f"  C tuning requested: using {args.cv_folds}-fold CV for selection")
-
-    # Initialize NLI model (needed for feature extraction in both branches)
     print("\nInitializing SelfCheckNLI model...")
     effective_batch_size = args.batch_size
     if device.type == 'cuda':
@@ -499,14 +407,9 @@ def main():
     # Single train/test split path below
     # Split data
     if args.split_by_doc:
-        # Split by document to ensure sentences from same doc stay together
-        # Use stratified splitting to maintain class distribution
         from sklearn.model_selection import train_test_split
         
         unique_docs = np.unique(doc_indices)
-        
-        # Compute document-level labels for stratification
-        # Use majority label per document (or proportion-based stratification)
         doc_labels = []
         for doc_idx in unique_docs:
             doc_mask = doc_indices == doc_idx
@@ -568,7 +471,7 @@ def main():
         print(f"  Train sentences: {len(train_sentences)}")
         print(f"  Test sentences: {len(test_sentences)}")
     
-    # Print class distribution for both splits
+
     print(f"\nClass Distribution:")
     print(f"  Train - Factual (0): {np.sum(y_train == 0)} ({np.mean(y_train == 0)*100:.1f}%)")
     print(f"  Train - Non-factual (1): {np.sum(y_train == 1)} ({np.mean(y_train == 1)*100:.1f}%)")
