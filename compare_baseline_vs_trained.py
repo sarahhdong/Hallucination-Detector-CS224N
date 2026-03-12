@@ -1,7 +1,5 @@
 """
-Compare baseline (original SelfCheckNLI) vs trained model on test set.
-
-Computes AUC-PR (Area Under Precision-Recall Curve) for both methods.
+compare baseline vs trained model on test set
 """
 
 import numpy as np
@@ -27,14 +25,6 @@ from selfcheckgpt.modeling_selfcheck_extended import SelfCheckNLI as SelfCheckNL
 
 
 def load_wikibio_test_data(test_size=0.3, random_seed=42, split_by_doc=False):
-    """
-    Load WikiBio test data (same split as training).
-    
-    Returns:
-        test_sentences: List of sentences
-        test_labels: Array of labels (0=factual, 1=hallucinated)
-        test_sampled_passages: List of sampled passages
-    """
     print("Loading WikiBio dataset...")
     dataset = load_dataset('potsawee/wiki_bio_gpt3_hallucination')
     dataset = dataset['evaluation']
@@ -64,7 +54,6 @@ def load_wikibio_test_data(test_size=0.3, random_seed=42, split_by_doc=False):
     
     all_labels = np.array(all_labels)
     
-    # Split data (same as training)
     if split_by_doc:
         from sklearn.model_selection import train_test_split
         unique_docs = np.unique(doc_indices)
@@ -108,26 +97,16 @@ def load_wikibio_test_data(test_size=0.3, random_seed=42, split_by_doc=False):
 
 
 def evaluate_baseline(test_sentences, test_sampled_passages, test_labels, nli_model, device, batch_size=32):
-    """
-    Evaluate baseline SelfCheckNLI (original, unsupervised method).
-    
-    Returns:
-        scores: Array of contradiction scores (higher = more likely hallucinated)
-    """
     print("\n" + "="*60)
     print("BASELINE: Original SelfCheckNLI (Unsupervised)")
     print("="*60)
     
-    # Use original SelfCheckNLI class
     baseline_nli = SelfCheckNLIBaseline(nli_model=nli_model, device=device)
     
-    # Process sentences one by one (original predict() handles one sentence at a time)
     all_scores = []
     
     print(f"Processing {len(test_sentences)} sentences...")
     for i, (sent, passages) in enumerate(zip(test_sentences, test_sampled_passages)):
-        # Original predict() takes: [sentence] and list of passages
-        # Returns: average contradiction probability across all passages
         score = baseline_nli.predict([sent], passages)
         all_scores.append(score[0])
         
@@ -135,10 +114,6 @@ def evaluate_baseline(test_sentences, test_sampled_passages, test_labels, nli_mo
             print(f"  Processed {i + 1}/{len(test_sentences)} sentences...")
     
     scores = np.array(all_scores)
-    
-    # Compute metrics
-    # For baseline: higher score = more likely hallucinated (contradiction probability)
-    # So scores directly correspond to hallucination probability
     predictions = (scores > 0.5).astype(int)
     
     accuracy = accuracy_score(test_labels, predictions)
@@ -146,22 +121,14 @@ def evaluate_baseline(test_sentences, test_sampled_passages, test_labels, nli_mo
     recall = recall_score(test_labels, predictions, zero_division=0)
     f1 = f1_score(test_labels, predictions, zero_division=0)
     
-    # AUC-ROC
     try:
         roc_auc = roc_auc_score(test_labels, scores)
     except:
         roc_auc = 0.0
     
-    # AUC-PR (Precision-Recall)
-    pr_auc = average_precision_score(test_labels, scores)
+    auc_pr = average_precision_score(test_labels, scores)
     
-    print(f"\nBaseline Metrics:")
-    print(f"  Accuracy:  {accuracy:.4f}")
-    print(f"  Precision: {precision:.4f}")
-    print(f"  Recall:    {recall:.4f}")
-    print(f"  F1 Score:  {f1:.4f}")
-    print(f"  ROC-AUC:   {roc_auc:.4f}")
-    print(f"  AUC-PR:    {pr_auc:.4f}")
+    print(f"  AUC-PR:    {auc_pr:.4f}")
     
     return scores, {
         'accuracy': accuracy,
@@ -169,12 +136,11 @@ def evaluate_baseline(test_sentences, test_sampled_passages, test_labels, nli_mo
         'recall': recall,
         'f1': f1,
         'roc_auc': roc_auc,
-        'pr_auc': pr_auc
+        'auc_pr': auc_pr
     }
 
 
 def compute_metrics_from_scores(test_labels, scores):
-    """Compute baseline metrics from cached or freshly computed baseline scores."""
     predictions = (scores > 0.5).astype(int)
     accuracy = accuracy_score(test_labels, predictions)
     precision = precision_score(test_labels, predictions, zero_division=0)
@@ -184,14 +150,14 @@ def compute_metrics_from_scores(test_labels, scores):
         roc_auc = roc_auc_score(test_labels, scores)
     except Exception:
         roc_auc = 0.0
-    pr_auc = average_precision_score(test_labels, scores)
+    auc_pr = average_precision_score(test_labels, scores)
     return {
         'accuracy': accuracy,
         'precision': precision,
         'recall': recall,
         'f1': f1,
         'roc_auc': roc_auc,
-        'pr_auc': pr_auc
+        'auc_pr': auc_pr
     }
 
 
@@ -205,17 +171,10 @@ def evaluate_trained(
     batch_size=32,
     cached_features=None,
 ):
-    """
-    Evaluate trained supervised model.
-    
-    Returns:
-        probabilities: Array of hallucination probabilities
-    """
     print("\n" + "="*60)
     print("TRAINED: Supervised Logistic Regression Model")
     print("="*60)
     
-    # Load trained model
     print(f"Loading trained model from {model_path}...")
     with open(model_path, 'rb') as f:
         model_data = pickle.load(f)
@@ -227,19 +186,13 @@ def evaluate_trained(
         print(f"Using cached test features: shape={cached_features.shape}")
         features = cached_features
     else:
-        # Initialize extended NLI model for feature extraction
         extended_nli = SelfCheckNLIExtended(nli_model=nli_model, device=device, batch_size=batch_size)
-        
-        # Extract features
-        # Note: extract_features expects sampled_passages to be a list of strings (shared),
-        # but we have a list of lists (one per sentence). Process each sentence individually.
         print(f"Extracting features for {len(test_sentences)} sentences...")
         
         all_features = []
         for i, (sent, passages) in enumerate(zip(test_sentences, test_sampled_passages)):
-            # Extract features for this sentence with its passages
             sent_features = extended_nli.extract_features([sent], passages)
-            all_features.append(sent_features[0])  # Get single feature vector
+            all_features.append(sent_features[0])  
             
             if (i + 1) % 50 == 0:
                 print(f"  Processed {i + 1}/{len(test_sentences)} sentences...")
@@ -248,7 +201,7 @@ def evaluate_trained(
     
     # Predict
     predictions = classifier.predict(features)
-    probabilities = classifier.predict_proba(features)[:, 1]  # Probability of class 1 (hallucinated)
+    probabilities = classifier.predict_proba(features)[:, 1] 
     
     # Compute metrics
     accuracy = accuracy_score(test_labels, predictions)
@@ -256,22 +209,14 @@ def evaluate_trained(
     recall = recall_score(test_labels, predictions, zero_division=0)
     f1 = f1_score(test_labels, predictions, zero_division=0)
     
-    # AUC-ROC
     try:
         roc_auc = roc_auc_score(test_labels, probabilities)
     except:
         roc_auc = 0.0
     
-    # AUC-PR (Precision-Recall)
-    pr_auc = average_precision_score(test_labels, probabilities)
+    auc_pr = average_precision_score(test_labels, probabilities)
     
-    print(f"\nTrained Model Metrics:")
-    print(f"  Accuracy:  {accuracy:.4f}")
-    print(f"  Precision: {precision:.4f}")
-    print(f"  Recall:    {recall:.4f}")
-    print(f"  F1 Score:  {f1:.4f}")
-    print(f"  ROC-AUC:   {roc_auc:.4f}")
-    print(f"  AUC-PR:    {pr_auc:.4f}")
+    print(f"  AUC-PR:    {auc_pr:.4f}")
     
     return probabilities, {
         'accuracy': accuracy,
@@ -279,7 +224,7 @@ def evaluate_trained(
         'recall': recall,
         'f1': f1,
         'roc_auc': roc_auc,
-        'pr_auc': pr_auc
+        'auc_pr': auc_pr
     }
 
 
@@ -307,7 +252,6 @@ def main():
     args = parser.parse_args()
     args.split_by_doc = not args.no_split_by_doc
 
-    # Setup device
     if args.device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -316,25 +260,22 @@ def main():
             if torch.cuda.is_available():
                 device = torch.device("cuda")
             else:
-                print("⚠️  Warning: CUDA requested but not available. Falling back to CPU.")
+                print("Warning: CUDA requested but not available. Falling back to CPU.")
                 device = torch.device("cpu")
         else:
             device = torch.device(requested_device)
     print(f"Using device: {device}")
     
-    # Load test data
     test_sentences, test_labels, test_sampled_passages = load_wikibio_test_data(
         test_size=args.test_size,
         random_seed=args.random_seed,
         split_by_doc=args.split_by_doc
     )
     
-    # Resolve cache directory once
     cache_dir = Path(args.cache_dir) if args.cache_dir else None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Evaluate baseline (if not skipped)
     if not args.skip_baseline:
         baseline_scores = None
         baseline_cache_file = None
@@ -347,14 +288,14 @@ def main():
                     cached_scores = np.load(baseline_cache_file)['scores']
                     if len(cached_scores) == len(test_labels):
                         baseline_scores = cached_scores
-                        print(f"✅ Loaded cached baseline scores from {baseline_cache_file}")
+                        print(f"Loaded cached baseline scores from {baseline_cache_file}")
                     else:
                         print(
-                            f"⚠️  Cached baseline score count mismatch: "
+                            f"Cached baseline score count mismatch: "
                             f"{len(cached_scores)} vs {len(test_labels)} labels. Recomputing baseline."
                         )
                 except Exception as e:
-                    print(f"⚠️  Could not load cached baseline scores ({e}). Recomputing baseline.")
+                    print(f"Could not load cached baseline scores ({e}). Recomputing baseline.")
 
         if baseline_scores is None:
             baseline_scores, _ = evaluate_baseline(
@@ -372,23 +313,17 @@ def main():
                             'split_by_doc': args.split_by_doc,
                             'nli_model': args.nli_model or 'default',
                         }, f, indent=2)
-                    print(f"💾 Saved baseline scores to cache: {baseline_cache_file}")
+                    print(f"Saved baseline scores to cache: {baseline_cache_file}")
                 except Exception as e:
-                    print(f"⚠️  Could not save baseline scores cache: {e}")
+                    print(f"Could not save baseline scores cache: {e}")
 
         baseline_metrics = compute_metrics_from_scores(test_labels, baseline_scores)
         print(f"\nBaseline Metrics:")
-        print(f"  Accuracy:  {baseline_metrics['accuracy']:.4f}")
-        print(f"  Precision: {baseline_metrics['precision']:.4f}")
-        print(f"  Recall:    {baseline_metrics['recall']:.4f}")
-        print(f"  F1 Score:  {baseline_metrics['f1']:.4f}")
-        print(f"  ROC-AUC:   {baseline_metrics['roc_auc']:.4f}")
-        print(f"  AUC-PR:    {baseline_metrics['pr_auc']:.4f}")
+        print(f"  AUC-PR:    {baseline_metrics['auc_pr']:.4f}")
     else:
         baseline_metrics = None
-        print("\n⚠️  Skipping baseline evaluation (--skip_baseline flag set)")
+        print("\nSkipping baseline evaluation (--skip_baseline flag set)")
     
-    # Try loading cached test features for trained-model evaluation
     cached_test_features = None
     if cache_dir is not None:
         test_cache_file = cache_dir / 'features_test.npz'
@@ -397,27 +332,25 @@ def main():
                 cached_test_features = np.load(test_cache_file)['features']
                 if len(cached_test_features) != len(test_labels):
                     print(
-                        f"⚠️  Cached test feature count mismatch: "
+                        f"Cached test feature count mismatch: "
                         f"{len(cached_test_features)} vs {len(test_labels)} labels. "
                         "Falling back to on-the-fly extraction."
                     )
                     cached_test_features = None
                 else:
-                    print(f"✅ Loaded cached test features from {test_cache_file}")
+                    print(f"Loaded cached test features from {test_cache_file}")
             except Exception as e:
-                print(f"⚠️  Could not load cached test features ({e}). Falling back to extraction.")
+                print(f"Could not load cached test features ({e}). Falling back to extraction.")
                 cached_test_features = None
         else:
-            print(f"ℹ️  No cached test features found at {test_cache_file}. Falling back to extraction.")
+            print(f"No cached test features found at {test_cache_file}. Falling back to extraction.")
 
-    # Evaluate trained model
     trained_probs, trained_metrics = evaluate_trained(
         test_sentences, test_sampled_passages, test_labels,
         args.model, args.nli_model, device, args.batch_size,
         cached_features=cached_test_features
     )
     
-    # Comparison (if baseline was evaluated)
     if baseline_metrics is not None:
         print("\n" + "="*60)
         print("COMPARISON: Baseline vs Trained Model")
@@ -425,7 +358,7 @@ def main():
         print(f"\n{'Metric':<15} {'Baseline':<12} {'Trained':<12} {'Improvement':<12}")
         print("-" * 60)
         
-        metrics_to_compare = ['accuracy', 'precision', 'recall', 'f1', 'roc_auc', 'pr_auc']
+        metrics_to_compare = ['accuracy', 'precision', 'recall', 'f1', 'roc_auc', 'auc_pr']
         for metric in metrics_to_compare:
             baseline_val = baseline_metrics[metric]
             trained_val = trained_metrics[metric]
@@ -435,20 +368,15 @@ def main():
         
         print("\n" + "="*60)
         print("Key Results:")
-        print(f"  Baseline AUC-PR:  {baseline_metrics['pr_auc']:.4f}")
-        print(f"  Trained AUC-PR:   {trained_metrics['pr_auc']:.4f}")
-        print(f"  Improvement:      {trained_metrics['pr_auc'] - baseline_metrics['pr_auc']:+.4f}")
+        print(f"  Baseline AUC-PR:  {baseline_metrics['auc_pr']:.4f}")
+        print(f"  Trained AUC-PR:   {trained_metrics['auc_pr']:.4f}")
+        print(f"  Improvement:      {trained_metrics['auc_pr'] - baseline_metrics['auc_pr']:+.4f}")
         print("="*60)
     else:
         print("\n" + "="*60)
         print("TRAINED MODEL RESULTS")
         print("="*60)
-        print(f"\nAUC-PR: {trained_metrics['pr_auc']:.4f}")
-        print(f"ROC-AUC: {trained_metrics['roc_auc']:.4f}")
-        print(f"Accuracy: {trained_metrics['accuracy']:.4f}")
-        print(f"Precision: {trained_metrics['precision']:.4f}")
-        print(f"Recall: {trained_metrics['recall']:.4f}")
-        print(f"F1 Score: {trained_metrics['f1']:.4f}")
+        print(f"\nAUC-PR: {trained_metrics['auc_pr']:.4f}")
         print("="*60)
 
 
